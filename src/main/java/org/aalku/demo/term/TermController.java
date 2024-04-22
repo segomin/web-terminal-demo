@@ -3,23 +3,16 @@ package org.aalku.demo.term;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
 import java.util.Base64;
 import java.util.Base64.Encoder;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
-import org.aalku.demo.term.TermController.UpdateListener.BytesEvent;
-import org.aalku.demo.term.TermController.UpdateListener.EofEvent;
+import io.fabric8.kubernetes.client.dsl.ExecWatch;
+import lombok.extern.slf4j.Slf4j;
 import org.aalku.demo.term.TermController.UpdateListener.Stream;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import org.json.JSONObject;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.DisposableBean;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -29,27 +22,21 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketHandler;
 import org.springframework.web.socket.WebSocketSession;
-import org.springframework.web.socket.handler.AbstractWebSocketHandler;
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.RemovalCause;
 import com.github.benmanes.caffeine.cache.RemovalListener;
-import com.pty4j.PtyProcess;
-import com.pty4j.PtyProcessBuilder;
-import com.pty4j.WinSize;
+import org.springframework.web.socket.handler.TextWebSocketHandler;
 
+import static org.aalku.demo.term.K8sClientProvider.k8sExecWatch;
+
+@Slf4j
 @RestController
 public class TermController implements DisposableBean {
-	
-	private static final List<String> COMMAND = Arrays.asList("C:\\Windows\\System32\\cmd.exe");
-	// private static final List<String> COMMAND = Arrays.asList("/bin/bash");
-	
 	private static final String SESSION_KEY_TERM_UUID = "TERM-UUID";
 
-	private Logger log = LoggerFactory.getLogger(TermController.class);
-	
-	public final WebSocketHandler wsHandler = new AbstractWebSocketHandler() {
+	public final WebSocketHandler wsHandler = new TextWebSocketHandler() {
 		
 		@Override
 		public boolean supportsPartialMessages() {
@@ -60,7 +47,7 @@ public class TermController implements DisposableBean {
 		protected void handleTextMessage(WebSocketSession session, TextMessage message) throws Exception {
 			try {
 				String s = message.getPayload();
-				log.info("handleTextMessage: {}", s);
+				// log.info("handleTextMessage: {}", s);
 				if (s.startsWith("{")) {
 					JSONObject o = new JSONObject(s);
 					String to = o.getString("to");
@@ -102,26 +89,17 @@ public class TermController implements DisposableBean {
 
 	public class TermSession {
 		private final UUID uuid;
-		private final PtyProcess process;
+		private final ExecWatch process;
 		private final UpdateListener updateListener;
 		private final WebSocketSession wss;
 
-		public TermSession(UUID uuid, Map<String, String> env, List<String> cmd, UpdateListener updateConsumer, WebSocketSession wss) throws IOException {
+		public TermSession(UUID uuid, String namespace, String pod, UpdateListener updateConsumer, WebSocketSession wss) throws IOException {
 			this.uuid = uuid;
-			
-			Map<String, String> sessionEnv = new HashMap<>(System.getenv());
-			sessionEnv.putAll(env);
-			sessionEnv.put("TERM", "xterm");
-			String[] commandArray = cmd.toArray(new String[0]);
-
-			this.process = new PtyProcessBuilder().setCommand(commandArray).setRedirectErrorStream(false)
-					.setInitialColumns(80).setInitialRows(30)
-					.setEnvironment(sessionEnv)
-					.start();
+            this.process = k8sExecWatch(namespace, pod);
 			this.updateListener = updateConsumer;
 			this.wss = wss;
-			stdOutThread(process.getInputStream(), UpdateListener.Stream.STDOUT).start();
-			stdOutThread(process.getErrorStream(), UpdateListener.Stream.STDERR).start();
+			stdOutThread(process.getOutput(), UpdateListener.Stream.STDOUT).start();
+			stdOutThread(process.getOutput(), UpdateListener.Stream.STDERR).start();
 		}
 
 		private Thread stdOutThread(InputStream out, Stream stream) {
@@ -163,16 +141,16 @@ public class TermController implements DisposableBean {
 		public void write(String string) throws IOException {
 			byte[] bytes = string.getBytes(StandardCharsets.UTF_8);
 			// log.info("Bytes to pty ({}): {}", debugBytes(bytes), string);
-			process.getOutputStream().write(bytes);
-			process.getOutputStream().flush();
+			process.getInput().write(bytes);
+			process.getInput().flush();
 		}
 
 		public void resized(int cols, int rows) {
-			process.setWinSize(new WinSize(cols - 1, rows));
+			process.resize(cols - 1, rows);
 		}
 
 		public boolean isClosed() {
-			return !process.isAlive();
+			return false; // todo !process.isAlive();
 		}
 
 		public WebSocketSession getWss() {
@@ -186,9 +164,9 @@ public class TermController implements DisposableBean {
 			
 			@Override
 			public void onRemoval(@Nullable UUID key, @Nullable TermSession value, RemovalCause cause) {
-				if (value.process.isAlive()) {
-					value.process.destroyForcibly();
-				}
+				// if (value.process.isAlive()) {
+				// 	value.process.destroyForcibly();
+				// } todo implement corresponding logic
 			}
 		};
 	}
@@ -219,8 +197,8 @@ public class TermController implements DisposableBean {
 		sessions.cleanUp();
 	}
 
-	private TermSession newSession(UpdateListener updateListener, WebSocketSession wss, List<String> command) throws IOException {
-		TermSession session = new TermSession(UUID.randomUUID(), Collections.emptyMap(), command, updateListener, wss);
+	private TermSession newSession(UpdateListener updateListener, WebSocketSession wss, String namespace, String pod) throws IOException {
+		TermSession session = new TermSession(UUID.randomUUID(), namespace, pod, updateListener, wss);
 		sessions.put(session.getUUID(), session);
 		return session;
 	}
@@ -229,31 +207,37 @@ public class TermController implements DisposableBean {
 		UUID uuid = (UUID) wss.getAttributes().get(SESSION_KEY_TERM_UUID);
 		TermSession ts = uuid == null ? null : sessions.getIfPresent(uuid);
 
-		if (data instanceof String) {
-			if (data.equals("new-session")) {
-				Encoder encoder = Base64.getEncoder();
-				TermSession s = newSession(event->{
-					JSONObject o = new JSONObject();
-					if (event instanceof BytesEvent) {
-						o.put("cause", "update");
-						o.put("b64", encoder.encodeToString(((BytesEvent)event).bytes));
-					} else if (event instanceof EofEvent) {
-						o.put("cause", "EOF");
-					}
-					o.put("stream", event.stream);
-					try {
-						sendMessage(wss, o.toString());
-					} catch (IOException e) {
-						throw new RuntimeException(e);
-					}
-				}, wss, COMMAND);
-				wss.getAttributes().put(SESSION_KEY_TERM_UUID, s.getUUID());
-				sendMessage(wss, "{ \"cause\": \"new-session\", \"sessionId\": \"" + s.getUUID().toString() + "\"}");
-			}
-		} else if (data instanceof JSONObject) {
+		if (data instanceof JSONObject) {
 			JSONObject o = (JSONObject) data;
 			String event = o.optString("event");
 			if (event != null) {
+				if (event.equals("new-session")) {
+					Encoder encoder = Base64.getEncoder();
+					String namespace = o.optString("namespace");
+					String pod = o.optString("pod");
+					TermSession s = newSession(new UpdateListener() {
+						@Override
+						public void update(UpdateListener.Event event) {
+							JSONObject o = new JSONObject();
+							if (event instanceof BytesEvent) {
+								o.put("cause", "update");
+								o.put("b64", encoder.encodeToString(((BytesEvent) event).bytes));
+							} else if (event instanceof EofEvent) {
+								o.put("cause", "EOF");
+							}
+							o.put("stream", event.stream);
+							try {
+								sendMessage(wss, o.toString());
+							} catch (IOException e) {
+								throw new RuntimeException(e);
+							}
+						}
+					}, wss, namespace, pod);
+					sessions.put(s.getUUID(), s);
+
+					wss.getAttributes().put(SESSION_KEY_TERM_UUID, s.getUUID());
+					sendMessage(wss, "{ \"cause\": \"new-session\", \"sessionId\": \"" + s.getUUID().toString() + "\"}");
+				}
 				if (event.equals("type")) {
 					if (ts == null) {
 						synchronized (wss) {

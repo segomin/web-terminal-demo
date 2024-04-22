@@ -21,7 +21,13 @@
 		function connect() {
 			sock = new SockJS('/ws-terminal', undefined, {transports: null});
 			sock.onopen = function (){
-				sendMessage('tm', 'new-session');
+				console.log('WebSocket is open now.');
+				// sendMessage('tm', 'new-session');
+				sendMessage('tm', {
+					event: "new-session",
+					namespace: 'kube-system',
+					pod: "local-path-provisioner-6c86858495-9stbx"
+				});
 			};
 			sock.onmessage = async function (e) {
 				if (e.data) {
