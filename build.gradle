@@ -1,0 +1,40 @@
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '3.2.5'
+    id 'io.spring.dependency-management' version '1.1.4'
+}
+
+group = 'org.aalku.demo'
+version = '0.0.1-SNAPSHOT'
+description = 'web-terminal-demo'
+
+java {
+    sourceCompatibility = '21'
+}
+
+repositories {
+    mavenCentral()
+    maven {
+        url 'https://packages.jetbrains.team/maven/p/ij/intellij-dependencies'
+        content {
+            includeGroup 'org.jetbrains.pty4j'
+        }
+    }
+}
+
+
+dependencies {
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-websocket'
+    implementation 'com.github.ben-manes.caffeine:caffeine'
+    implementation 'org.json:json:20240303'
+    implementation 'org.jetbrains.pty4j:pty4j:0.12.13'
+
+    developmentOnly 'org.springframework.boot:spring-boot-devtools'
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+}
+
